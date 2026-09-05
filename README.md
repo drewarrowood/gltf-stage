@@ -43,13 +43,32 @@ Then drop the `.glb` onto the canvas, or use **Open files**.
 | Animation | Choose a clip, Play / Pause / Stop, drag the timeline, **Loop**. Space toggles play |
 | Wireframe / auto-rotate | Checkboxes in **View** |
 | Deselect | Click empty space or **Esc** |
+| Recenter for VR | **Recenter / Reset view** (before Enter VR) |
+| Enter VR | **Enter VR** (shown only when WebXR / immersive-vr is available) |
+
+## Quest 3 (WebXR)
+
+Quest Browser needs a **secure context** (HTTPS). GitHub Pages is enough — no native app and no sideload.
+
+1. Enable Pages on this repo and open the Pages URL in **Meta Quest Browser** (not the 2D desktop preview alone).
+2. The built-in `models/sample.glb` loads automatically. Prefer **`.glb`** from Blender (**File → Export → glTF 2.0 (.glb)**).
+3. Quest drag-and-drop / file pickers are limited. Host the file under [`models/`](models/) and either:
+   - type `models/your.glb` in **Load path**, or
+   - open `https://<you>.github.io/gltf-stage/?model=your.glb`  
+     (`?model=models/your.glb` and `?url=https://…/file.glb` also work).
+4. Click **Recenter / Reset view** so the model sits on the floor about 1.6 m in front of you (fitted to ~1.3 m). Then **Enter VR**.
+5. Standing / floor reference space is requested when the headset supports it (`local-floor`, then `local`).
+6. In VR: controller ray + trigger **select** picks a mesh (same as a desktop click). Hold trigger to **grab / move**. Play animations before or after entering — the mixer runs on the XR frame loop.
+7. Exit with **Exit VR** or the headset’s leave-immersive control. You can also recenter with Quest’s system gesture (Meta button).
+
+On a desktop browser without a headset, **Enter VR** stays hidden and orbit / gizmo keep working.
 
 ## Files
 
 ```
 index.html          # page + import map (no bundler)
 css/stage.css
-js/stage.js         # Three.js scene, loader, gizmo, mixer
+js/stage.js         # Three.js scene, loader, gizmo, mixer, WebXR
 models/sample.glb   # tiny built-in scene
 scripts/make_sample_glb.py   # regenerate the sample if you want
 .nojekyll

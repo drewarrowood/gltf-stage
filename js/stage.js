@@ -2,8 +2,12 @@ import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { TransformControls } from "three/addons/controls/TransformControls.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import { XRControllerModelFactory } from "three/addons/webxr/XRControllerModelFactory.js";
 
 const SAMPLE_URL = new URL("../models/sample.glb", import.meta.url).href;
+const XR_SESSION_OPTIONS = {
+  optionalFeatures: ["local-floor", "bounded-floor", "layers"],
+};
 
 const $ = (id) => document.getElementById(id);
 const els = {
@@ -22,6 +26,8 @@ const els = {
   spaceLocal: $("space-local"),
   file: $("file-input"),
   folder: $("folder-input"),
+  modelPath: $("model-path"),
+  vr: $("btn-vr"),
   pos: [$("pos-x"), $("pos-y"), $("pos-z")],
   rot: [$("rot-x"), $("rot-y"), $("rot-z")],
   scl: [$("scl-x"), $("scl-y"), $("scl-z")],
@@ -40,7 +46,9 @@ renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.05;
 renderer.shadowMap.enabled = true;
-renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.shadowMap.type = THREE.PCFShadowMap;
+renderer.xr.enabled = true;
+renderer.xr.setReferenceSpaceType("local-floor");
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x10151d);
@@ -55,7 +63,7 @@ scene.add(hemi);
 const sun = new THREE.DirectionalLight(0xfff3dd, 1.55);
 sun.position.set(5.5, 8.5, 4.2);
 sun.castShadow = true;
-sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.mapSize.set(1024, 1024);
 sun.shadow.camera.near = 0.5;
 sun.shadow.camera.far = 30;
 sun.shadow.camera.left = -8;
@@ -86,6 +94,10 @@ ground.receiveShadow = true;
 ground.name = "__ground";
 scene.add(ground);
 
+const stage = new THREE.Group();
+stage.name = "__stage";
+scene.add(stage);
+
 const orbit = new OrbitControls(camera, renderer.domElement);
 orbit.enableDamping = true;
 orbit.dampingFactor = 0.08;
@@ -97,13 +109,25 @@ const transform = new TransformControls(camera, renderer.domElement);
 transform.setSize(0.9);
 scene.add(transform.getHelper());
 transform.addEventListener("dragging-changed", (e) => {
-  orbit.enabled = !e.value;
+  orbit.enabled = !e.value && !renderer.xr.isPresenting;
 });
 transform.addEventListener("objectChange", () => syncTransformInputs());
 
 const raycaster = new THREE.Raycaster();
 const pointer = new THREE.Vector2();
-const clock = new THREE.Clock();
+const timer = new THREE.Timer();
+timer.connect(document);
+
+const _world = new THREE.Vector3();
+const _dir = new THREE.Vector3();
+const _box = new THREE.Box3();
+const _size = new THREE.Vector3();
+const _center = new THREE.Vector3();
+const _grabWorld = new THREE.Matrix4();
+const _parentInv = new THREE.Matrix4();
+const _local = new THREE.Matrix4();
+
+const xrControllers = [];
 
 const state = {
   root: null,
@@ -115,6 +139,7 @@ const state = {
   blobUrls: [],
   playing: false,
   sourceLabel: "",
+  xrHasFloor: true,
 };
 
 function setStatus(text, isError = false) {
@@ -123,6 +148,7 @@ function setStatus(text, isError = false) {
 }
 
 function resize() {
+  if (renderer.xr.isPresenting) return;
   const { clientWidth: w, clientHeight: h } = els.viewport;
   if (!w || !h) return;
   camera.aspect = w / h;
@@ -149,6 +175,13 @@ function disposeObject(obj) {
   });
 }
 
+function resetStagePlacement() {
+  stage.position.set(0, 0, 0);
+  stage.quaternion.identity();
+  stage.scale.set(1, 1, 1);
+  stage.updateMatrixWorld(true);
+}
+
 function clearModel() {
   clearHighlight();
   transform.detach();
@@ -161,10 +194,11 @@ function clearModel() {
   state.clips = [];
   state.playing = false;
   if (state.root) {
-    scene.remove(state.root);
+    stage.remove(state.root);
     disposeObject(state.root);
     state.root = null;
   }
+  resetStagePlacement();
   for (const url of state.blobUrls) URL.revokeObjectURL(url);
   state.blobUrls = [];
   els.hierarchy.replaceChildren();
@@ -195,16 +229,44 @@ function frameObject(obj) {
   const center = box.getCenter(new THREE.Vector3());
   const radius = size.length() * 0.5 || 1;
   const fov = THREE.MathUtils.degToRad(camera.fov);
-  const dist = radius / Math.tan(fov * 0.5) * 1.15;
+  const dist = (radius / Math.tan(fov * 0.5)) * 1.15;
   const dir = new THREE.Vector3(1.05, 0.62, 1.15).normalize();
   camera.position.copy(center).addScaledVector(dir, dist);
   camera.near = Math.max(dist / 200, 0.01);
-  camera.far = Math.max(dist * 40, 50);
+  camera.far = Math.max(dist * 40, 80);
   camera.updateProjectionMatrix();
   orbit.target.copy(center);
   orbit.update();
   sun.target.position.copy(center);
   sun.target.updateMatrixWorld();
+}
+
+function ensureXrCameraRange() {
+  camera.near = 0.05;
+  camera.far = Math.max(camera.far, 80);
+  camera.updateProjectionMatrix();
+}
+
+function placeForXr() {
+  if (!state.root) return;
+  resetStagePlacement();
+  _box.setFromObject(state.root);
+  if (_box.isEmpty()) return;
+  _box.getSize(_size);
+  const maxDim = Math.max(_size.x, _size.y, _size.z, 0.001);
+  const scale = THREE.MathUtils.clamp(1.35 / maxDim, 0.001, 100);
+  stage.scale.setScalar(scale);
+  stage.updateMatrixWorld(true);
+  _box.setFromObject(state.root);
+  _box.getCenter(_center);
+  stage.position.x += -_center.x;
+  stage.position.z += -_center.z - 1.65;
+  stage.position.y += -_box.min.y;
+  if (!state.xrHasFloor) stage.position.y -= 1.55;
+  stage.updateMatrixWorld(true);
+  sun.target.position.set(0, 0.7, -1.65);
+  sun.target.updateMatrixWorld();
+  if (!renderer.xr.isPresenting) frameObject(state.root);
 }
 
 function applyWireframe() {
@@ -289,7 +351,7 @@ function selectObject(obj) {
     markHierarchy();
     return;
   }
-  transform.attach(obj);
+  if (!renderer.xr.isPresenting) transform.attach(obj);
   highlightObject(obj);
   els.selName.textContent = obj.name || obj.type;
   markHierarchy();
@@ -347,7 +409,14 @@ function pickableMeshes() {
   return list;
 }
 
+function namedFromHit(hitObject) {
+  let obj = hitObject;
+  while (obj && obj !== state.root && !obj.name) obj = obj.parent;
+  return obj || hitObject;
+}
+
 function onPointerUp(event) {
+  if (renderer.xr.isPresenting) return;
   if (transform.dragging || transform.axis) return;
   if (event.button !== 0) return;
   const rect = renderer.domElement.getBoundingClientRect();
@@ -359,9 +428,7 @@ function onPointerUp(event) {
     selectObject(null);
     return;
   }
-  let obj = hits[0].object;
-  while (obj && obj !== state.root && !obj.name) obj = obj.parent;
-  selectObject(obj || hits[0].object);
+  selectObject(namedFromHit(hits[0].object));
 }
 
 function setMode(mode) {
@@ -369,6 +436,179 @@ function setMode(mode) {
   for (const btn of document.querySelectorAll("[data-mode]")) {
     btn.classList.toggle("active", btn.dataset.mode === mode);
   }
+}
+
+function createControllerRay() {
+  const geom = new THREE.BufferGeometry().setFromPoints([
+    new THREE.Vector3(0, 0, 0),
+    new THREE.Vector3(0, 0, -1),
+  ]);
+  const line = new THREE.Line(
+    geom,
+    new THREE.LineBasicMaterial({ color: 0x6cb6ff, transparent: true, opacity: 0.9 }),
+  );
+  line.name = "__xrRay";
+  line.scale.z = 4;
+  const dot = new THREE.Mesh(
+    new THREE.SphereGeometry(0.012, 12, 8),
+    new THREE.MeshBasicMaterial({ color: 0x6cb6ff }),
+  );
+  dot.position.z = -1;
+  line.add(dot);
+  return line;
+}
+
+function pickFromController(controller) {
+  _world.setFromMatrixPosition(controller.matrixWorld);
+  _dir.set(0, 0, -1).transformDirection(controller.matrixWorld);
+  raycaster.set(_world, _dir);
+  return raycaster.intersectObjects(pickableMeshes(), true);
+}
+
+function releaseGrab(controller) {
+  controller.userData.grabbed = null;
+  controller.userData.grabOffset = null;
+}
+
+function onXrSelectStart(controller) {
+  const hits = pickFromController(controller);
+  if (!hits.length) {
+    selectObject(null);
+    return;
+  }
+  const obj = namedFromHit(hits[0].object);
+  selectObject(obj);
+  if (!obj) return;
+  controller.userData.grabbed = obj;
+  const offset = new THREE.Matrix4();
+  offset.copy(controller.matrixWorld).invert();
+  offset.multiply(obj.matrixWorld);
+  controller.userData.grabOffset = offset;
+}
+
+function onXrSelectEnd(controller) {
+  releaseGrab(controller);
+}
+
+function updateGrabs() {
+  for (const controller of xrControllers) {
+    const obj = controller.userData.grabbed;
+    const offset = controller.userData.grabOffset;
+    if (!obj || !offset) continue;
+    _grabWorld.multiplyMatrices(controller.matrixWorld, offset);
+    if (obj.parent) {
+      _parentInv.copy(obj.parent.matrixWorld).invert();
+      _local.multiplyMatrices(_parentInv, _grabWorld);
+      _local.decompose(obj.position, obj.quaternion, obj.scale);
+    } else {
+      _grabWorld.decompose(obj.position, obj.quaternion, obj.scale);
+    }
+    obj.updateMatrixWorld();
+  }
+  if (xrControllers.some((c) => c.userData.grabbed)) syncTransformInputs();
+}
+
+function updateControllerRays() {
+  for (const controller of xrControllers) {
+    const ray = controller.userData.ray;
+    if (!ray || !controller.visible) continue;
+    const hits = pickFromController(controller);
+    const len = hits.length ? Math.max(hits[0].distance, 0.05) : 4;
+    ray.scale.z = len;
+  }
+}
+
+function setupControllers() {
+  const factory = new XRControllerModelFactory();
+  for (let i = 0; i < 2; i += 1) {
+    const controller = renderer.xr.getController(i);
+    const ray = createControllerRay();
+    controller.add(ray);
+    controller.userData.ray = ray;
+    controller.visible = false;
+    controller.addEventListener("connected", () => {
+      controller.visible = true;
+    });
+    controller.addEventListener("disconnected", () => {
+      controller.visible = false;
+      releaseGrab(controller);
+    });
+    controller.addEventListener("selectstart", () => onXrSelectStart(controller));
+    controller.addEventListener("selectend", () => onXrSelectEnd(controller));
+    scene.add(controller);
+
+    const grip = renderer.xr.getControllerGrip(i);
+    grip.add(factory.createControllerModel(grip));
+    scene.add(grip);
+    xrControllers.push(controller);
+  }
+}
+
+function setVrButtonState(presenting) {
+  if (!els.vr) return;
+  els.vr.textContent = presenting ? "Exit VR" : "Enter VR";
+  els.vr.classList.toggle("presenting", presenting);
+}
+
+async function probeXr() {
+  if (!els.vr) return;
+  els.vr.hidden = true;
+  if (!window.isSecureContext || !navigator.xr?.isSessionSupported) return;
+  try {
+    const ok = await navigator.xr.isSessionSupported("immersive-vr");
+    if (!ok) return;
+    els.vr.hidden = false;
+  } catch {
+    els.vr.hidden = true;
+  }
+}
+
+async function toggleXr() {
+  if (renderer.xr.isPresenting) {
+    const session = renderer.xr.getSession();
+    if (session) await session.end();
+    return;
+  }
+  if (!navigator.xr) {
+    setStatus("WebXR is not available in this browser.", true);
+    return;
+  }
+  try {
+    const session = await navigator.xr.requestSession("immersive-vr", XR_SESSION_OPTIONS);
+    let spaceType = "local-floor";
+    try {
+      await session.requestReferenceSpace("local-floor");
+      state.xrHasFloor = true;
+    } catch {
+      spaceType = "local";
+      state.xrHasFloor = false;
+    }
+    renderer.xr.setReferenceSpaceType(spaceType);
+    await renderer.xr.setSession(session);
+  } catch (err) {
+    setStatus(String(err.message || err), true);
+  }
+}
+
+function onXrSessionStart() {
+  setVrButtonState(true);
+  placeForXr();
+  ensureXrCameraRange();
+  transform.enabled = false;
+  transform.detach();
+  transform.getHelper().visible = false;
+  orbit.enabled = false;
+}
+
+function onXrSessionEnd() {
+  setVrButtonState(false);
+  transform.enabled = true;
+  transform.getHelper().visible = true;
+  orbit.enabled = true;
+  for (const controller of xrControllers) releaseGrab(controller);
+  if (state.selected) transform.attach(state.selected);
+  resize();
+  if (state.root) frameObject(state.root);
 }
 
 function createProceduralSample() {
@@ -417,7 +657,7 @@ function mountGltf(gltf, label) {
   const root = gltf.scene || gltf.scenes[0];
   root.name = root.name || "Scene";
   storeBindPose(root);
-  scene.add(root);
+  stage.add(root);
   state.root = root;
   state.sourceLabel = label;
   state.clips = gltf.animations || [];
@@ -425,7 +665,8 @@ function mountGltf(gltf, label) {
   buildHierarchy(root);
   applyWireframe();
   setupClips();
-  frameObject(root);
+  if (renderer.xr.isPresenting) placeForXr();
+  else frameObject(root);
   const nMesh = countMeshes(root);
   const nClip = state.clips.length;
   setStatus(
@@ -528,14 +769,55 @@ function updateAnimUi() {
   if (dur > 0) els.timeline.value = String(Math.round((t / dur) * 1000));
 }
 
+function resolveModelSpec(raw) {
+  const text = (raw || "").trim();
+  if (!text) return null;
+  if (/^https:\/\//i.test(text)) {
+    return { url: text, label: text.split("/").pop() || text, path: text };
+  }
+  if (/^http:\/\//i.test(text)) {
+    throw new Error("Model URLs must be https.");
+  }
+  let path = text.replace(/^\/+/, "");
+  if (path.startsWith("./")) path = path.slice(2);
+  if (path.includes("..") || path.includes("\\")) {
+    throw new Error("Invalid model path.");
+  }
+  if (!path.startsWith("models/")) {
+    if (path.includes("/")) throw new Error("Hosted models must live under models/.");
+    path = `models/${path}`;
+  }
+  if (!/\.(glb|gltf)$/i.test(path)) {
+    throw new Error("Use a .glb or .gltf path under models/.");
+  }
+  return { url: new URL(path, document.baseURI).href, label: path.split("/").pop(), path };
+}
+
+function specFromLocation() {
+  const q = new URLSearchParams(location.search);
+  const model = q.get("model") || q.get("glb");
+  if (model) return resolveModelSpec(model);
+  const url = q.get("url");
+  if (url) return resolveModelSpec(url);
+  return null;
+}
+
 async function loadUrl(url, label) {
   const loader = new GLTFLoader();
   const gltf = await loader.loadAsync(url);
   mountGltf(gltf, label);
 }
 
+async function loadFromPathInput() {
+  const spec = resolveModelSpec(els.modelPath.value || "models/sample.glb");
+  if (!spec) return;
+  setStatus(`Loading ${spec.label}…`);
+  await loadUrl(spec.url, spec.label);
+}
+
 async function loadSample() {
   setStatus("Loading sample…");
+  if (els.modelPath && !els.modelPath.value) els.modelPath.value = "models/sample.glb";
   try {
     await loadUrl(SAMPLE_URL, "sample.glb");
   } catch (err) {
@@ -662,9 +944,9 @@ function onKeyDown(event) {
   }
 }
 
-function tick() {
-  requestAnimationFrame(tick);
-  const dt = clock.getDelta();
+function tick(time) {
+  timer.update(time);
+  const dt = timer.getDelta();
   if (state.mixer && state.playing) {
     state.mixer.update(dt);
     if (state.action && !els.loop.checked) {
@@ -676,8 +958,13 @@ function tick() {
     }
     updateAnimUi();
   }
-  orbit.autoRotate = els.auto.checked && !transform.dragging;
-  orbit.update();
+  if (renderer.xr.isPresenting) {
+    updateGrabs();
+    updateControllerRays();
+  } else {
+    orbit.autoRotate = els.auto.checked && !transform.dragging;
+    orbit.update();
+  }
   renderer.render(scene, camera);
 }
 
@@ -694,6 +981,22 @@ function bindUi() {
     orbit.target.set(0, 0.7, 0);
     if (state.root) frameObject(state.root);
     else orbit.update();
+  });
+  $("btn-recenter").addEventListener("click", () => {
+    placeForXr();
+    setStatus("Recentered for VR: model on the floor, ~1.6 m in front. Quest can also recenter with the Meta button.");
+  });
+  $("btn-load-path").addEventListener("click", () => {
+    loadFromPathInput().catch((err) => setStatus(String(err.message || err), true));
+  });
+  els.modelPath.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      loadFromPathInput().catch((err) => setStatus(String(err.message || err), true));
+    }
+  });
+  els.vr.addEventListener("click", () => {
+    toggleXr().catch((err) => setStatus(String(err.message || err), true));
   });
   $("btn-play").addEventListener("click", playAnim);
   $("btn-pause").addEventListener("click", pauseAnim);
@@ -767,9 +1070,29 @@ function bindUi() {
   window.addEventListener("keydown", onKeyDown);
   window.addEventListener("resize", resize);
   new ResizeObserver(resize).observe(els.viewport);
+  renderer.xr.addEventListener("sessionstart", onXrSessionStart);
+  renderer.xr.addEventListener("sessionend", onXrSessionEnd);
 }
 
-bindUi();
-resize();
-tick();
-loadSample().catch((err) => setStatus(String(err.message || err), true));
+async function boot() {
+  bindUi();
+  setupControllers();
+  resize();
+  renderer.setAnimationLoop(tick);
+  probeXr();
+  try {
+    const spec = specFromLocation();
+    if (spec) {
+      if (els.modelPath) els.modelPath.value = spec.path || spec.url;
+      setStatus(`Loading ${spec.label}…`);
+      await loadUrl(spec.url, spec.label);
+    } else {
+      await loadSample();
+    }
+  } catch (err) {
+    setStatus(String(err.message || err), true);
+    await loadSample().catch((fallbackErr) => setStatus(String(fallbackErr.message || fallbackErr), true));
+  }
+}
+
+boot();

@@ -109,6 +109,34 @@ select {
   border-color: #3d7ec4;
 }
 
+.btn.vr {
+  background: #1a5c3a;
+  border-color: #3ecf8e;
+}
+
+.btn.vr.presenting {
+  background: #5c3218;
+  border-color: var(--warn);
+}
+
+.path-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.path-row input,
+#model-path {
+  width: 100%;
+  background: #0f141b;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 5px 7px;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
 .btn:disabled {
   opacity: 0.45;
   cursor: default;
